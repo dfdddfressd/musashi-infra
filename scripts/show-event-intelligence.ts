@@ -127,10 +127,40 @@ const eventObjects = selectedClusters.map((cluster) => {
 });
 
 // ---------------------------------------------------------------------------
+// Quality metrics
+// ---------------------------------------------------------------------------
+
+const totalEvents = eventObjects.length;
+
+function pct(count: number): number {
+  if (totalEvents === 0) return 0;
+  return Math.round((count / totalEvents) * 100) / 100;
+}
+
+const nonNull24h = eventObjects.filter((e) => e.probability_change_24h !== null).length;
+const nonNull7d = eventObjects.filter((e) => e.probability_change_7d !== null).length;
+const singletons = selectedClusters.filter((c) => c.source === 'singleton').length;
+const totalRelated = eventObjects.reduce((sum, e) => sum + e.related_markets.length, 0);
+
+const qualityMetrics = {
+  total_events: totalEvents,
+  pct_non_null_24h_change: pct(nonNull24h),
+  pct_non_null_7d_change: pct(nonNull7d),
+  pct_singleton_clusters: pct(singletons),
+  avg_related_markets_per_event: totalEvents > 0 ? Math.round((totalRelated / totalEvents) * 10) / 10 : 0,
+  raw: {
+    non_null_24h: nonNull24h,
+    non_null_7d: nonNull7d,
+    singleton_clusters: singletons,
+    total_related_markets: totalRelated,
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
 
-console.log(JSON.stringify(eventObjects, null, 2));
+console.log(JSON.stringify({ quality_metrics: qualityMetrics, events: eventObjects }, null, 2));
 
 async function fetchActiveMarketRows(): Promise<Array<Record<string, unknown>>> {
   const rows: Array<Record<string, unknown>> = [];

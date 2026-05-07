@@ -145,6 +145,75 @@ describe('computeProbabilityChange', () => {
     expect(result).not.toBeNull();
     expect(result!).toBeCloseTo(0.1);
   });
+
+  // ----- sparse / stale history honesty tests -----
+
+  it('returns null for 24h when the only non-latest snapshot is 2 days old (outside 36h tolerance)', () => {
+    const id = 'musashi-kalshi-m99';
+    // 2d = 48h; tolerance for 24h window = 12h → target band is 12h–36h ago.
+    // 48h is outside that band, so we must return null rather than a fake delta.
+    const snapshots = [
+      buildSnapshot(id, '2026-04-12T12:00:00Z', 0.4), // 48h before latest
+      buildSnapshot(id, '2026-04-14T12:00:00Z', 0.6),
+    ];
+    expect(computeProbabilityChange(id, snapshots, 24)).toBeNull();
+  });
+
+  it('returns null for 7d when history only goes back 3 days (inside 3.5d tolerance floor)', () => {
+    const id = 'musashi-kalshi-m99';
+    // 7d tolerance window = 3.5d–10.5d ago. 3d (72h) is inside 3.5d floor → null.
+    const snapshots = [
+      buildSnapshot(id, '2026-04-11T00:00:00Z', 0.35), // 3d before April 14
+      buildSnapshot(id, '2026-04-14T00:00:00Z', 0.6),
+    ];
+    expect(computeProbabilityChange(id, snapshots, 7 * 24)).toBeNull();
+  });
+
+  it('returns null for 7d when only same-day snapshots exist', () => {
+    const id = 'musashi-kalshi-m99';
+    const snapshots = [buildSnapshot(id, '2026-04-14T08:00:00Z', 0.5), buildSnapshot(id, '2026-04-14T16:00:00Z', 0.55)];
+    expect(computeProbabilityChange(id, snapshots, 7 * 24)).toBeNull();
+  });
+
+  it('returns non-null just inside the 24h tolerance window', () => {
+    const id = 'musashi-kalshi-m99';
+    // Tolerance for 24h = 12h. A snapshot 23h ago is within [12h, 36h] → accepted.
+    const snapshots = [
+      buildSnapshot(id, '2026-04-13T13:00:00Z', 0.5), // 23h before April 14 12:00
+      buildSnapshot(id, '2026-04-14T12:00:00Z', 0.65),
+    ];
+    const result = computeProbabilityChange(id, snapshots, 24);
+    expect(result).not.toBeNull();
+    expect(result!).toBeCloseTo(0.15);
+  });
+
+  it('accepts a reference snapshot exactly at the tolerance boundary (guard is strict >)', () => {
+    const id = 'musashi-kalshi-m99';
+    // Latest: April 14 12:00. Target for 24h: April 13 12:00.
+    // Reference: April 13 00:00 → diff from target = 12h exactly.
+    // toleranceMs for 24h = 24 * 0.5 * 3600000 = 43 200 000ms (12h).
+    // bestDiff (43 200 000) === toleranceMs → guard `bestDiff > toleranceMs` is false → accepted.
+    const snapshots = [
+      buildSnapshot(id, '2026-04-13T00:00:00Z', 0.4), // 12h from target — exactly at boundary
+      buildSnapshot(id, '2026-04-14T12:00:00Z', 0.6),
+    ];
+    const result = computeProbabilityChange(id, snapshots, 24);
+    expect(result).not.toBeNull();
+    expect(result!).toBeCloseTo(0.2);
+  });
+
+  it('does not manufacture a 7d change from only 8-day-old history', () => {
+    const id = 'musashi-kalshi-m99';
+    // 7d tolerance window is 3.5d–10.5d ago. 8d is within that band → non-null.
+    // This test confirms the OPPOSITE: stale-but-within-window data IS accepted.
+    const snapshots = [
+      buildSnapshot(id, '2026-04-06T00:00:00Z', 0.3), // 8d before April 14
+      buildSnapshot(id, '2026-04-14T00:00:00Z', 0.6),
+    ];
+    const result = computeProbabilityChange(id, snapshots, 7 * 24);
+    expect(result).not.toBeNull();
+    expect(result!).toBeCloseTo(0.3);
+  });
 });
 
 // ---------------------------------------------------------------------------
