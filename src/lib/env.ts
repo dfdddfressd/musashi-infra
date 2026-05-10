@@ -7,7 +7,7 @@ const MusashiEnvSchema = z.object({
   supabaseServiceKey: z.string().nullable().optional().default(null),
   fullSyncPageSize: z.coerce.number().int().positive().default(1000),
   fullSyncPageBudget: z.coerce.number().int().positive().default(10),
-  fullSyncAbsoluteMaxPages: z.coerce.number().int().positive().default(1000),
+  fullSyncAbsoluteMaxPages: z.coerce.number().int().positive().default(5000),
   fullSyncProgressEveryPages: z.coerce.number().int().positive().default(1),
   resolutionCheckMaxMarkets: z.coerce.number().int().positive().default(200),
   resolutionCheckProgressEveryMarkets: z.coerce.number().int().positive().default(25),
