@@ -13,6 +13,7 @@ import { getSupabase } from './supabase.js';
 
 const DB_BATCH_SIZE = 200;
 const SNAPSHOT_LOOKBACK_DAYS = 8; // covers both 24h and 7d change windows
+const TOP_EVENTS_MARKET_SCAN_LIMIT = 5_000;
 
 const MARKET_COLUMNS =
   'id,platform,platform_id,event_id,series_id,title,description,category,url,' +
@@ -57,7 +58,7 @@ export async function listEventIntelligenceByCategory(
  * sorted by primary market liquidity descending.
  */
 export async function listTopEventIntelligence(limit = 10): Promise<EventIntelligence[]> {
-  const markets = await fetchActiveMarkets({});
+  const markets = await fetchActiveMarkets({ maxRows: TOP_EVENTS_MARKET_SCAN_LIMIT });
   return buildEvents(markets, limit);
 }
 
@@ -68,6 +69,7 @@ export async function listTopEventIntelligence(limit = 10): Promise<EventIntelli
 interface FetchMarketsOptions {
   eventId?: string;
   category?: MarketCategory;
+  maxRows?: number;
 }
 
 async function fetchActiveMarkets(options: FetchMarketsOptions): Promise<MusashiMarket[]> {
@@ -97,6 +99,17 @@ async function fetchActiveMarkets(options: FetchMarketsOptions): Promise<Musashi
     }
 
     rows.push(...((data ?? []) as unknown as Array<Record<string, unknown>>));
+
+    if (options.maxRows !== undefined && rows.length >= options.maxRows) {
+      return rows.slice(0, options.maxRows).map(
+        (row): MusashiMarket => ({
+          ...(row as Omit<MusashiMarket, 'fetched_at' | 'cache_hit' | 'data_age_seconds'>),
+          fetched_at: (row['last_ingested_at'] as string | undefined) ?? new Date().toISOString(),
+          cache_hit: false,
+          data_age_seconds: 0,
+        })
+      );
+    }
 
     if (!data || data.length < MARKET_PAGE_SIZE) break;
     from += MARKET_PAGE_SIZE;
