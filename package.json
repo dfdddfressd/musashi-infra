@@ -36,6 +36,7 @@
     "status:collection": "tsx scripts/show-collection-summary.ts",
     "status:storage": "tsx scripts/show-storage-summary.ts",
     "status:resolution": "tsx scripts/show-resolution-summary.ts",
+    "status:resolution:kpis": "tsx scripts/show-resolution-kpis.ts",
     "status:gap": "tsx scripts/show-gap-summary.ts",
     "check:collection": "tsx scripts/check-collection-health.ts",
     "event:show": "tsx scripts/show-event-intelligence.ts"

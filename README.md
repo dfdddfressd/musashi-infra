@@ -65,6 +65,7 @@ npm run job:gap-detection
 npm run status:collection
 npm run status:crawl
 npm run status:resolution
+npm run status:resolution:kpis
 npm run status:gap
 ```
 

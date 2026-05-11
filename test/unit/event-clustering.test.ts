@@ -326,4 +326,78 @@ describe('selectPrimaryMarket', () => {
     const second = selectPrimaryMarket([...markets].reverse());
     expect(first.id).toBe(second.id);
   });
+
+  it('picks liquidity 0 over null liquidity (zero is a known value, null is unknown)', () => {
+    const zeroLiq = buildMarket({ liquidity: 0, open_interest: null, volume_24h: 0 });
+    const nullLiq = buildMarket({ liquidity: null, open_interest: null, volume_24h: 0 });
+
+    expect(selectPrimaryMarket([nullLiq, zeroLiq])).toBe(zeroLiq);
+  });
+
+  it('is stable across arbitrary input orderings (10 shuffles)', () => {
+    const markets = Array.from({ length: 8 }, (_, i) =>
+      buildMarket({ id: `musashi-kalshi-stable-${i}`, liquidity: null, volume_24h: 0, closes_at: null })
+    );
+    const expected = selectPrimaryMarket(markets).id;
+
+    for (let i = 0; i < 10; i++) {
+      const shuffled = [...markets].sort(() => Math.random() - 0.5);
+      expect(selectPrimaryMarket(shuffled).id).toBe(expected);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// clusterMarkets — adversarial / noisy inputs
+// ---------------------------------------------------------------------------
+
+describe('clusterMarkets (adversarial)', () => {
+  it('treats a tab-only event_id as blank and creates a singleton', () => {
+    const m = buildMarket({ event_id: '\t' });
+    const clusters = clusterMarkets([m]);
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0]?.source).toBe('singleton');
+  });
+
+  it('treats mixed-whitespace event_id as blank and creates a singleton', () => {
+    const m = buildMarket({ event_id: ' \t \n ' });
+    const clusters = clusterMarkets([m]);
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0]?.source).toBe('singleton');
+  });
+
+  it('is case-sensitive: FED-SEP and fed-sep form separate clusters', () => {
+    const upper = buildMarket({ event_id: 'FED-SEP' });
+    const lower = buildMarket({ event_id: 'fed-sep' });
+    const clusters = clusterMarkets([upper, lower]);
+    expect(clusters).toHaveLength(2);
+    expect(clusters.every((c) => c.source === 'event_id')).toBe(true);
+    expect(clusters.every((c) => c.markets.length === 1)).toBe(true);
+  });
+
+  it('does not merge a whitespace-padded event_id with the trimmed version', () => {
+    // The raw string is used as the map key, so " FED-SEP " and "FED-SEP" are different clusters.
+    const padded = buildMarket({ event_id: ' FED-SEP ' });
+    const clean = buildMarket({ event_id: 'FED-SEP' });
+    const clusters = clusterMarkets([padded, clean]);
+    expect(clusters).toHaveLength(2);
+  });
+
+  it('handles a large cluster (50 markets, same event_id) without dropping any', () => {
+    const markets = Array.from({ length: 50 }, () => buildMarket({ event_id: 'BIG-EVENT' }));
+    const clusters = clusterMarkets(markets);
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0]?.markets).toHaveLength(50);
+  });
+
+  it('does not merge an event_id cluster with a series_id cluster sharing the same raw value', () => {
+    // A market with event_id 'SHARED' and a market with series_id 'SHARED' (no event_id).
+    // They must end up in separate clusters.
+    const byEvent = buildMarket({ event_id: 'SHARED', series_id: null });
+    const bySeries = buildMarket({ event_id: null, series_id: 'SHARED' });
+    const clusters = clusterMarkets([byEvent, bySeries]);
+    expect(clusters).toHaveLength(2);
+    expect(clusters.find((c) => c.source === 'event_id')?.cluster_id).toBe('SHARED');
+    expect(clusters.find((c) => c.source === 'series_id')?.cluster_id).toBe('series:SHARED');
+  });
 });

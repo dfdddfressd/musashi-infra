@@ -202,6 +202,21 @@ describe('computeProbabilityChange', () => {
     expect(result!).toBeCloseTo(0.2);
   });
 
+  it('picks the snapshot closest to the target look-back time when multiple are within tolerance', () => {
+    const id = 'musashi-kalshi-m99';
+    // Latest: April 14 12:00. Target (24h back): April 13 12:00. Tolerance window: ±12h.
+    // April 13 06:00 is 6h from target; April 13 00:00 is 12h from target (boundary).
+    // The closer snapshot (06:00, price 0.4) should be selected over the boundary one (00:00, price 0.3).
+    const snapshots = [
+      buildSnapshot(id, '2026-04-13T00:00:00Z', 0.3), // 12h from target — at boundary
+      buildSnapshot(id, '2026-04-13T06:00:00Z', 0.4), // 6h from target — closer
+      buildSnapshot(id, '2026-04-14T12:00:00Z', 0.6), // latest
+    ];
+    const result = computeProbabilityChange(id, snapshots, 24);
+    expect(result).not.toBeNull();
+    expect(result!).toBeCloseTo(0.2); // 0.6 - 0.4
+  });
+
   it('does not manufacture a 7d change from only 8-day-old history', () => {
     const id = 'musashi-kalshi-m99';
     // 7d tolerance window is 3.5d–10.5d ago. 8d is within that band → non-null.
@@ -316,6 +331,31 @@ describe('labelRelation', () => {
     expect(labelRelation(0.4, 0.4)).toBe('confirming');
     expect(labelRelation(0.6, 0.6)).toBe('confirming');
     expect(labelRelation(0.41, 0.59)).toBe('related'); // just inside ambiguous zone
+  });
+
+  // ----- adversarial: exact thresholds and extreme values -----
+
+  it('returns contradicting when primary is exactly 0.6 and related is exactly 0.4', () => {
+    // Both sit exactly on their respective thresholds — one bullish, one bearish.
+    expect(labelRelation(0.6, 0.4)).toBe('contradicting');
+  });
+
+  it('returns contradicting at maximum spread (1.0 vs 0.0)', () => {
+    expect(labelRelation(1.0, 0.0)).toBe('contradicting');
+    expect(labelRelation(0.0, 1.0)).toBe('contradicting');
+  });
+
+  it('returns confirming when both prices are at 0.0 (both maximally bearish)', () => {
+    expect(labelRelation(0.0, 0.0)).toBe('confirming');
+  });
+
+  it('returns confirming when both prices are at 1.0 (both maximally bullish)', () => {
+    expect(labelRelation(1.0, 1.0)).toBe('confirming');
+  });
+
+  it('returns related when both prices are just inside the neutral zone (0.599 / 0.401)', () => {
+    // Just below bullish and just above bearish — neither threshold is reached.
+    expect(labelRelation(0.599, 0.401)).toBe('related');
   });
 });
 
@@ -525,5 +565,37 @@ describe('buildEventIntelligence', () => {
       // The field must exist on the object (value may legitimately be null)
       expect(Object.prototype.hasOwnProperty.call(result, key)).toBe(true);
     }
+  });
+
+  // ----- adversarial: snapshot isolation and threshold precision -----
+
+  it('does not bleed snapshots from other markets into the primary change calculation', () => {
+    // Primary market has no useful history; other market has abundant history.
+    // The change fields must both be null, not borrowing from the unrelated market.
+    const primary = buildMarket({ id: 'musashi-kalshi-primary', liquidity: 50_000 });
+    const other = buildMarket({ id: 'musashi-kalshi-other', liquidity: 100 });
+    const cluster = buildCluster([primary, other]);
+    const snapshots = [
+      buildSnapshot(other.id, '2026-04-07T00:00:00Z', 0.3),
+      buildSnapshot(other.id, '2026-04-13T00:00:00Z', 0.5),
+      buildSnapshot(other.id, '2026-04-14T00:00:00Z', 0.7),
+    ];
+
+    const result = buildEventIntelligence(cluster, snapshots, 0);
+
+    expect(result.probability_change_24h).toBeNull();
+    expect(result.probability_change_7d).toBeNull();
+  });
+
+  it('correctly labels a related market whose price exactly hits the confirming threshold', () => {
+    // Primary is at 0.8 (bullish). Related is at exactly 0.6 (threshold — should be bullish → confirming).
+    const primary = buildMarket({ liquidity: 50_000, yes_price: 0.8, no_price: 0.2 });
+    const atThreshold = buildMarket({ yes_price: 0.6, no_price: 0.4 });
+    const cluster = buildCluster([primary, atThreshold]);
+
+    const result = buildEventIntelligence(cluster, [], 0);
+    const related = result.related_markets.find((r) => r.market_id === atThreshold.id);
+
+    expect(related?.relation).toBe('confirming');
   });
 });
