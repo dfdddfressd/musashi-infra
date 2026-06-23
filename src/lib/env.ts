@@ -33,6 +33,11 @@ const MusashiEnvSchema = z.object({
   snapshotActiveWindowHours: z.coerce.number().int().positive().default(24),
   snapshotMinVolume24h: z.coerce.number().nonnegative().default(1000),
   snapshotMinLiquidity: z.coerce.number().nonnegative().default(1000),
+  // Polymarket sync config
+  polymarketBaseUrl: z.string().url().default('https://gamma-api.polymarket.com'),
+  polymarketSyncPageSize: z.coerce.number().int().positive().default(100),
+  polymarketSyncPageBudget: z.coerce.number().int().positive().default(20),
+  polymarketSyncAbsoluteMaxPages: z.coerce.number().int().positive().default(500),
 });
 
 export type MusashiEnv = z.infer<typeof MusashiEnvSchema>;
@@ -70,6 +75,11 @@ export function getEnv(): MusashiEnv {
     snapshotActiveWindowHours: process.env.SNAPSHOT_ACTIVE_WINDOW_HOURS,
     snapshotMinVolume24h: process.env.SNAPSHOT_MIN_VOLUME_24H,
     snapshotMinLiquidity: process.env.SNAPSHOT_MIN_LIQUIDITY,
+    // Polymarket sync config
+    polymarketBaseUrl: process.env.POLYMARKET_BASE_URL,
+    polymarketSyncPageSize: process.env.POLYMARKET_SYNC_PAGE_SIZE,
+    polymarketSyncPageBudget: process.env.POLYMARKET_SYNC_PAGE_BUDGET,
+    polymarketSyncAbsoluteMaxPages: process.env.POLYMARKET_SYNC_ABSOLUTE_MAX_PAGES,
   };
 
   const result = MusashiEnvSchema.safeParse(rawEnv);

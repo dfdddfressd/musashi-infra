@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 
 import { KalshiClient, KalshiPaginationBudgetError, KalshiPaginationCursorError } from '../api/kalshi-client.js';
-import { normalizeKalshiBatch } from '../api/normalizer.js';
+import { PolymarketClient } from '../api/polymarket-client.js';
+import { normalizeKalshiBatch, normalizePolymarketBatch } from '../api/normalizer.js';
 import { getEnv } from '../lib/env.js';
 import { selectSnapshotCandidates } from '../lib/snapshot-policy.js';
 import { getCheckpoint, upsertCheckpoint, clearCheckpoint } from '../db/checkpoints.js';
@@ -19,7 +20,7 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
   const env = getEnv();
   const checkpoint = await getCheckpoint(FULL_SYNC_CHECKPOINT_KEY);
   const snapshotTime = checkpoint?.snapshot_time ? new Date(checkpoint.snapshot_time) : startedAt;
-  const snapshotCandidates = [];
+  const snapshotCandidates: Parameters<typeof writeSnapshots>[0] = [];
 
   await failOpenRuns('full_sync', 'Superseded by a newer full_sync run before completion.');
 
@@ -54,101 +55,155 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
     notes: null,
   };
 
-  const client = new KalshiClient({
-    baseUrl: env.kalshiBaseUrl,
-  });
+  const kalshiClient = new KalshiClient({ baseUrl: env.kalshiBaseUrl });
+  const polymarketClient = new PolymarketClient({ baseUrl: env.polymarketBaseUrl });
 
-  try {
-    let pageIndex = checkpoint?.page_count ?? 0;
-    let nextCursor = checkpoint?.cursor ?? '';
-    result.kalshi_markets_fetched = checkpoint?.market_count ?? 0;
+  // ── Kalshi: resolve page budget before kicking off parallel syncs ──────────
+  let pageIndex = checkpoint?.page_count ?? 0;
+  let nextCursor = checkpoint?.cursor ?? '';
+  result.kalshi_markets_fetched = checkpoint?.market_count ?? 0;
 
-    const remainingAbsolutePages = Math.max(0, env.fullSyncAbsoluteMaxPages - pageIndex);
-    const runPageBudget = Math.min(env.fullSyncPageBudget, remainingAbsolutePages);
+  const remainingAbsolutePages = Math.max(0, env.fullSyncAbsoluteMaxPages - pageIndex);
+  const runPageBudget = Math.min(env.fullSyncPageBudget, remainingAbsolutePages);
 
-    if (runPageBudget <= 0) {
-      throw new KalshiPaginationBudgetError(
-        `Kalshi crawl reached the configured absolute page cap of ${env.fullSyncAbsoluteMaxPages}`
-      );
-    }
+  if (runPageBudget <= 0) {
+    // Budget exhausted — fail fast before spawning any work
+    const err = new KalshiPaginationBudgetError(
+      `Kalshi crawl reached the configured absolute page cap of ${env.fullSyncAbsoluteMaxPages}`
+    );
+    result.kalshi_available = true;
+    result.status = result.kalshi_markets_fetched > 0 ? 'partial' : 'failed';
+    result.errors.push({
+      source: 'kalshi',
+      error_type: 'page_budget_exhausted',
+      error_message: err.message,
+    });
+    result.kalshi_errors += 1;
+    result.notes = `Full sync paused after ${result.kalshi_markets_fetched} markets. Resume checkpoint retained.`;
+    result.completed_at = new Date().toISOString();
+    result.duration_ms = new Date(result.completed_at).getTime() - startedAt.getTime();
+    await completeRun(result);
+    return result;
+  }
 
-    for await (const page of client.iterateMarkets({
-      cursor: nextCursor,
-      limit: env.fullSyncPageSize,
-      status: 'open',
-      maxPages: runPageBudget,
-    })) {
-      pageIndex += 1;
-      const fetchedAt = new Date();
-      result.kalshi_fetch_ms = (result.kalshi_fetch_ms ?? 0) + page.fetch_ms;
-      result.kalshi_markets_fetched += page.markets.length;
+  // ── Run Kalshi and Polymarket syncs in parallel ───────────────────────────
+  const [kalshiSyncOutcome, polymarketSyncOutcome] = await Promise.allSettled([
 
-      const normalizedBatch = normalizeKalshiBatch(page.markets, fetchedAt);
-      result.kalshi_errors += normalizedBatch.errors.length;
+    // Kalshi sync (unchanged logic from original full-sync.ts)
+    (async () => {
+      for await (const page of kalshiClient.iterateMarkets({
+        cursor: nextCursor,
+        limit: env.fullSyncPageSize,
+        status: 'open',
+        maxPages: runPageBudget,
+      })) {
+        pageIndex += 1;
+        const fetchedAt = new Date();
+        result.kalshi_fetch_ms = (result.kalshi_fetch_ms ?? 0) + page.fetch_ms;
+        result.kalshi_markets_fetched += page.markets.length;
 
-      for (const error of normalizedBatch.errors) {
-        result.errors.push({
-          source: 'kalshi',
-          error_type: 'normalize_failed',
-          error_message: error.error,
-          market_id: error.platform_id,
-        });
-      }
+        const normalizedBatch = normalizeKalshiBatch(page.markets, fetchedAt);
+        result.kalshi_errors += normalizedBatch.errors.length;
 
-      const upsertResult = await upsertMarkets(normalizedBatch.normalized);
-      result.kalshi_markets_new += upsertResult.kalshi_new;
-      const pageSnapshotCandidates = selectSnapshotCandidates(
-        normalizedBatch.normalized.map(({ market }) => market),
-        fetchedAt,
-        {
-          limit: Math.max(0, env.snapshotCandidateLimit - snapshotCandidates.length),
-          activeWindowHours: env.snapshotActiveWindowHours,
-          minVolume24h: env.snapshotMinVolume24h,
-          minLiquidity: env.snapshotMinLiquidity,
+        for (const error of normalizedBatch.errors) {
+          result.errors.push({
+            source: 'kalshi',
+            error_type: 'normalize_failed',
+            error_message: error.error,
+            market_id: error.platform_id,
+          });
         }
-      );
-      snapshotCandidates.push(...pageSnapshotCandidates);
 
-      nextCursor = page.cursor;
+        const upsertResult = await upsertMarkets(normalizedBatch.normalized);
+        result.kalshi_markets_new += upsertResult.kalshi_new;
 
-      await upsertCheckpoint({
-        checkpoint_key: FULL_SYNC_CHECKPOINT_KEY,
-        run_type: 'full_sync',
-        cursor: nextCursor === '' ? null : nextCursor,
-        page_count: pageIndex,
-        market_count: result.kalshi_markets_fetched,
-        snapshot_time: snapshotTime.toISOString(),
-        job_id: jobId,
-      });
+        const pageSnapshotCandidates = selectSnapshotCandidates(
+          normalizedBatch.normalized.map(({ market }) => market),
+          fetchedAt,
+          {
+            limit: Math.max(0, env.snapshotCandidateLimit - snapshotCandidates.length),
+            activeWindowHours: env.snapshotActiveWindowHours,
+            minVolume24h: env.snapshotMinVolume24h,
+            minLiquidity: env.snapshotMinLiquidity,
+          }
+        );
+        snapshotCandidates.push(...pageSnapshotCandidates);
 
-      if (pageIndex % env.fullSyncProgressEveryPages === 0 || nextCursor === '') {
-        result.notes = formatProgressNote({
-          resumed: checkpoint !== null,
-          pageIndex,
-          marketCount: result.kalshi_markets_fetched,
-          snapshotsWritten: result.kalshi_snapshots_written,
-          snapshotCandidates: snapshotCandidates.length,
-          nextCursor,
+        nextCursor = page.cursor;
+
+        await upsertCheckpoint({
+          checkpoint_key: FULL_SYNC_CHECKPOINT_KEY,
+          run_type: 'full_sync',
+          cursor: nextCursor === '' ? null : nextCursor,
+          page_count: pageIndex,
+          market_count: result.kalshi_markets_fetched,
+          snapshot_time: snapshotTime.toISOString(),
+          job_id: jobId,
         });
-        await updateRunProgress(jobId, {
-          kalshi_markets_fetched: result.kalshi_markets_fetched,
-          kalshi_markets_new: result.kalshi_markets_new,
-          kalshi_snapshots_written: result.kalshi_snapshots_written,
-          kalshi_errors: result.kalshi_errors,
-          kalshi_fetch_ms: result.kalshi_fetch_ms,
-          errors: result.errors,
-          status: 'running',
-          notes: result.notes,
-        });
+
+        if (pageIndex % env.fullSyncProgressEveryPages === 0 || nextCursor === '') {
+          result.notes = formatProgressNote({
+            resumed: checkpoint !== null,
+            pageIndex,
+            marketCount: result.kalshi_markets_fetched,
+            snapshotsWritten: result.kalshi_snapshots_written,
+            snapshotCandidates: snapshotCandidates.length,
+            nextCursor,
+          });
+          await updateRunProgress(jobId, {
+            kalshi_markets_fetched: result.kalshi_markets_fetched,
+            kalshi_markets_new: result.kalshi_markets_new,
+            kalshi_snapshots_written: result.kalshi_snapshots_written,
+            kalshi_errors: result.kalshi_errors,
+            kalshi_fetch_ms: result.kalshi_fetch_ms,
+            errors: result.errors,
+            status: 'running',
+            notes: result.notes,
+          });
+        }
       }
-    }
+    })(),
 
+    // Polymarket sync
+    (async () => {
+      const polyPageBudget = Math.min(env.polymarketSyncPageBudget, env.polymarketSyncAbsoluteMaxPages);
+
+      for await (const page of polymarketClient.iterateMarkets({
+        limit: env.polymarketSyncPageSize,
+        maxPages: polyPageBudget,
+      })) {
+        const fetchedAt = new Date();
+        result.polymarket_fetch_ms = (result.polymarket_fetch_ms ?? 0) + page.fetch_ms;
+        result.polymarket_markets_fetched += page.markets.length;
+
+        const normalizedBatch = normalizePolymarketBatch(page.markets, fetchedAt);
+        result.polymarket_errors += normalizedBatch.errors.length;
+
+        for (const error of normalizedBatch.errors) {
+          result.errors.push({
+            source: 'polymarket',
+            error_type: 'normalize_failed',
+            error_message: error.error,
+            market_id: error.platform_id,
+          });
+        }
+
+        const upsertResult = await upsertMarkets(normalizedBatch.normalized);
+        result.polymarket_markets_new += upsertResult.polymarket_new;
+      }
+
+      result.polymarket_available = true;
+    })(),
+  ]);
+
+  // ── Handle outcomes ───────────────────────────────────────────────────────
+
+  if (kalshiSyncOutcome.status === 'fulfilled') {
     const snapshotResult = await writeSnapshots(snapshotCandidates, snapshotTime, {
       source: 'kalshi_api_v2',
       fetchLatencyMs: result.kalshi_fetch_ms,
     });
     result.kalshi_snapshots_written += snapshotResult.kalshi_written;
-    const reconciledClosedMarkets = await reconcileMissingOpenMarkets('kalshi', startedAt.toISOString());
 
     await updateSourceHealth({
       source: 'kalshi',
@@ -158,14 +213,10 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
       last_error: null,
       last_error_at: null,
     });
-
-    await clearCheckpoint(FULL_SYNC_CHECKPOINT_KEY);
-    result.status = result.errors.length > 0 ? 'partial' : 'success';
-    result.notes = `Processed ${result.kalshi_markets_fetched} Kalshi markets across ${checkpoint?.page_count ? 'a resumed' : 'a fresh'} full sync, wrote ${result.kalshi_snapshots_written} active-market snapshots, and reconciled ${reconciledClosedMarkets} missing open markets.`;
-  } catch (error) {
+  } else {
+    const error = kalshiSyncOutcome.reason;
     const errorType = classifyFullSyncError(error);
-    result.kalshi_available = errorType === 'source_unavailable' ? false : true;
-    result.status = result.kalshi_markets_fetched > 0 ? 'partial' : 'failed';
+    result.kalshi_available = errorType !== 'source_unavailable';
     result.errors.push({
       source: 'kalshi',
       error_type: errorType,
@@ -177,16 +228,31 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
       source: 'kalshi',
       is_available: result.kalshi_available,
       market_count: result.kalshi_markets_fetched,
-      last_error: errorType === 'source_unavailable' ? (error instanceof Error ? error.message : String(error)) : null,
-      last_error_at: errorType === 'source_unavailable' ? new Date().toISOString() : null,
+      last_error: !result.kalshi_available ? (error instanceof Error ? error.message : String(error)) : null,
+      last_error_at: !result.kalshi_available ? new Date().toISOString() : null,
       last_successful_fetch: result.kalshi_available ? new Date().toISOString() : null,
     });
-
-    result.notes =
-      errorType === 'page_budget_exhausted'
-        ? `Full sync paused after ${result.kalshi_markets_fetched} markets. Resume checkpoint retained.`
-        : `Full sync stopped after ${result.kalshi_markets_fetched} markets. Resume checkpoint retained.`;
   }
+
+  if (polymarketSyncOutcome.status === 'rejected') {
+    const error = polymarketSyncOutcome.reason;
+    result.polymarket_available = false;
+    result.errors.push({
+      source: 'polymarket',
+      error_type: 'source_unavailable',
+      error_message: error instanceof Error ? error.message : String(error),
+    });
+    result.polymarket_errors += 1;
+  }
+
+  // ── Reconcile missing open markets for both platforms ────────────────────
+  const reconciledKalshi = await reconcileMissingOpenMarkets('kalshi', startedAt.toISOString());
+  const reconciledPolymarket = await reconcileMissingOpenMarkets('polymarket', startedAt.toISOString());
+
+  await clearCheckpoint(FULL_SYNC_CHECKPOINT_KEY);
+
+  result.status = result.errors.length > 0 ? 'partial' : 'success';
+  result.notes = `Processed ${result.kalshi_markets_fetched} Kalshi and ${result.polymarket_markets_fetched} Polymarket markets. Reconciled ${reconciledKalshi} Kalshi and ${reconciledPolymarket} Polymarket missing open markets.`;
 
   result.completed_at = new Date().toISOString();
   result.duration_ms = new Date(result.completed_at).getTime() - startedAt.getTime();
