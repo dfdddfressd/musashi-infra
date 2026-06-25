@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { KalshiClient, KalshiPaginationBudgetError, KalshiPaginationCursorError } from '../api/kalshi-client.js';
-import { PolymarketClient } from '../api/polymarket-client.js';
+import { PolymarketClient, PolymarketPaginationBudgetError } from '../api/polymarket-client.js';
 import { normalizeKalshiBatch, normalizePolymarketBatch } from '../api/normalizer.js';
 import { getEnv } from '../lib/env.js';
 import { selectSnapshotCandidates } from '../lib/snapshot-policy.js';
@@ -20,7 +20,8 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
   const env = getEnv();
   const checkpoint = await getCheckpoint(FULL_SYNC_CHECKPOINT_KEY);
   const snapshotTime = checkpoint?.snapshot_time ? new Date(checkpoint.snapshot_time) : startedAt;
-  const snapshotCandidates: Parameters<typeof writeSnapshots>[0] = [];
+  const kalshiSnapshotCandidates: Parameters<typeof writeSnapshots>[0] = [];
+  const polymarketSnapshotCandidates: Parameters<typeof writeSnapshots>[0] = [];
 
   await failOpenRuns('full_sync', 'Superseded by a newer full_sync run before completion.');
 
@@ -67,7 +68,6 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
   const runPageBudget = Math.min(env.fullSyncPageBudget, remainingAbsolutePages);
 
   if (runPageBudget <= 0) {
-    // Budget exhausted — fail fast before spawning any work
     const err = new KalshiPaginationBudgetError(
       `Kalshi crawl reached the configured absolute page cap of ${env.fullSyncAbsoluteMaxPages}`
     );
@@ -86,10 +86,13 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
     return result;
   }
 
+  // Track whether Kalshi completed a full crawl (cursor reached end)
+  // Used to gate reconciliation and checkpoint clearing.
+  let kalshiCompletedFullCrawl = false;
+
   // ── Run Kalshi and Polymarket syncs in parallel ───────────────────────────
   const [kalshiSyncOutcome, polymarketSyncOutcome] = await Promise.allSettled([
-
-    // Kalshi sync (unchanged logic from original full-sync.ts)
+    // Kalshi sync
     (async () => {
       for await (const page of kalshiClient.iterateMarkets({
         cursor: nextCursor,
@@ -121,13 +124,13 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
           normalizedBatch.normalized.map(({ market }) => market),
           fetchedAt,
           {
-            limit: Math.max(0, env.snapshotCandidateLimit - snapshotCandidates.length),
+            limit: Math.max(0, env.snapshotCandidateLimit - kalshiSnapshotCandidates.length),
             activeWindowHours: env.snapshotActiveWindowHours,
             minVolume24h: env.snapshotMinVolume24h,
             minLiquidity: env.snapshotMinLiquidity,
           }
         );
-        snapshotCandidates.push(...pageSnapshotCandidates);
+        kalshiSnapshotCandidates.push(...pageSnapshotCandidates);
 
         nextCursor = page.cursor;
 
@@ -147,7 +150,7 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
             pageIndex,
             marketCount: result.kalshi_markets_fetched,
             snapshotsWritten: result.kalshi_snapshots_written,
-            snapshotCandidates: snapshotCandidates.length,
+            snapshotCandidates: kalshiSnapshotCandidates.length,
             nextCursor,
           });
           await updateRunProgress(jobId, {
@@ -162,6 +165,9 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
           });
         }
       }
+
+      // nextCursor === '' means the full cursor chain was exhausted
+      kalshiCompletedFullCrawl = nextCursor === '';
     })(),
 
     // Polymarket sync
@@ -190,20 +196,34 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
 
         const upsertResult = await upsertMarkets(normalizedBatch.normalized);
         result.polymarket_markets_new += upsertResult.polymarket_new;
+
+        // Issue 7: collect Polymarket snapshot candidates
+        const pageSnapshotCandidates = selectSnapshotCandidates(
+          normalizedBatch.normalized.map(({ market }) => market),
+          fetchedAt,
+          {
+            limit: Math.max(0, env.snapshotCandidateLimit - polymarketSnapshotCandidates.length),
+            activeWindowHours: env.snapshotActiveWindowHours,
+            minVolume24h: env.snapshotMinVolume24h,
+            minLiquidity: env.snapshotMinLiquidity,
+          }
+        );
+        polymarketSnapshotCandidates.push(...pageSnapshotCandidates);
       }
 
       result.polymarket_available = true;
     })(),
   ]);
 
-  // ── Handle outcomes ───────────────────────────────────────────────────────
+  // ── Handle Kalshi outcome ─────────────────────────────────────────────────
 
   if (kalshiSyncOutcome.status === 'fulfilled') {
-    const snapshotResult = await writeSnapshots(snapshotCandidates, snapshotTime, {
+    // Issue 7: write Kalshi snapshots
+    const kalshiSnapshotResult = await writeSnapshots(kalshiSnapshotCandidates, snapshotTime, {
       source: 'kalshi_api_v2',
       fetchLatencyMs: result.kalshi_fetch_ms,
     });
-    result.kalshi_snapshots_written += snapshotResult.kalshi_written;
+    result.kalshi_snapshots_written += kalshiSnapshotResult.kalshi_written;
 
     await updateSourceHealth({
       source: 'kalshi',
@@ -213,6 +233,12 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
       last_error: null,
       last_error_at: null,
     });
+
+    // Issue 2 + 3: only reconcile and clear checkpoint after a complete crawl
+    if (kalshiCompletedFullCrawl) {
+      await reconcileMissingOpenMarkets('kalshi', startedAt.toISOString());
+      await clearCheckpoint(FULL_SYNC_CHECKPOINT_KEY);
+    }
   } else {
     const error = kalshiSyncOutcome.reason;
     const errorType = classifyFullSyncError(error);
@@ -232,27 +258,61 @@ export async function runFullSync(): Promise<IngestionRunRecord> {
       last_error_at: !result.kalshi_available ? new Date().toISOString() : null,
       last_successful_fetch: result.kalshi_available ? new Date().toISOString() : null,
     });
+    // Checkpoint retained — do not clear on partial/failed Kalshi sync
   }
 
-  if (polymarketSyncOutcome.status === 'rejected') {
+  // ── Handle Polymarket outcome ─────────────────────────────────────────────
+
+  if (polymarketSyncOutcome.status === 'fulfilled') {
+    // Issue 7: write Polymarket snapshots
+    if (polymarketSnapshotCandidates.length > 0) {
+      const polySnapshotResult = await writeSnapshots(polymarketSnapshotCandidates, snapshotTime, {
+        source: 'polymarket_gamma_api',
+        fetchLatencyMs: result.polymarket_fetch_ms,
+      });
+      result.polymarket_snapshots_written += polySnapshotResult.kalshi_written;
+    }
+
+    // Issue 6: update Polymarket source health on success
+    await updateSourceHealth({
+      source: 'polymarket',
+      is_available: true,
+      market_count: result.polymarket_markets_fetched,
+      last_successful_fetch: new Date().toISOString(),
+      last_error: null,
+      last_error_at: null,
+    });
+
+    // Issue 5: skip reconciliation for Polymarket — no checkpoint semantics yet,
+    // so bounded-window fetches would incorrectly mark older markets as closed.
+  } else {
     const error = polymarketSyncOutcome.reason;
-    result.polymarket_available = false;
+
+    // Issue 4: classify budget exhaustion separately from real outages
+    const isPageBudget = error instanceof PolymarketPaginationBudgetError;
+    const errorType = isPageBudget ? 'page_budget_exhausted' : 'source_unavailable';
+
+    result.polymarket_available = !isPageBudget;
     result.errors.push({
       source: 'polymarket',
-      error_type: 'source_unavailable',
+      error_type: errorType,
       error_message: error instanceof Error ? error.message : String(error),
     });
     result.polymarket_errors += 1;
+
+    // Issue 6: update Polymarket source health on failure
+    await updateSourceHealth({
+      source: 'polymarket',
+      is_available: result.polymarket_available,
+      market_count: result.polymarket_markets_fetched,
+      last_error: !result.polymarket_available ? (error instanceof Error ? error.message : String(error)) : null,
+      last_error_at: !result.polymarket_available ? new Date().toISOString() : null,
+      last_successful_fetch: result.polymarket_available ? new Date().toISOString() : null,
+    });
   }
 
-  // ── Reconcile missing open markets for both platforms ────────────────────
-  const reconciledKalshi = await reconcileMissingOpenMarkets('kalshi', startedAt.toISOString());
-  const reconciledPolymarket = await reconcileMissingOpenMarkets('polymarket', startedAt.toISOString());
-
-  await clearCheckpoint(FULL_SYNC_CHECKPOINT_KEY);
-
   result.status = result.errors.length > 0 ? 'partial' : 'success';
-  result.notes = `Processed ${result.kalshi_markets_fetched} Kalshi and ${result.polymarket_markets_fetched} Polymarket markets. Reconciled ${reconciledKalshi} Kalshi and ${reconciledPolymarket} Polymarket missing open markets.`;
+  result.notes = `Processed ${result.kalshi_markets_fetched} Kalshi and ${result.polymarket_markets_fetched} Polymarket markets. Kalshi full crawl: ${kalshiCompletedFullCrawl}.`;
 
   result.completed_at = new Date().toISOString();
   result.duration_ms = new Date(result.completed_at).getTime() - startedAt.getTime();

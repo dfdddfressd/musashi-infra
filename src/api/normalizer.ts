@@ -176,64 +176,81 @@ function assertPriceBounds(value: number, ticker: string, fieldName: string): nu
   return roundPrice(value);
 }
 
+function parseStringOrArray(value: string | string[] | undefined | null): string[] | null {
+  if (value === null || value === undefined) return null;
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 export function normalizePolymarketMarket(raw: PolymarketMarketRaw, fetchedAt: Date): NormalizerResult {
   const warnings: string[] = [];
- 
+
   if (!raw.question?.trim()) {
     throw new Error(`Polymarket market ${raw.conditionId} is missing a question/title`);
   }
- 
+
   if (!raw.conditionId) {
     throw new Error(`Polymarket market is missing conditionId`);
   }
- 
-  // Must be an active, open binary Yes/No market
+
   if (!raw.active || raw.closed || raw.archived) {
     throw new Error(`Polymarket market ${raw.conditionId} is not active/open`);
   }
- 
-  // Validate binary Yes/No outcomes
-  if (!Array.isArray(raw.outcomes) || raw.outcomes.length !== 2) {
+
+  // Parse JSON-string fields from Gamma API
+  const outcomes = parseStringOrArray(raw.outcomes);
+  const outcomePrices = parseStringOrArray(raw.outcomePrices);
+
+  if (!outcomes || outcomes.length !== 2) {
     throw new Error(`Polymarket market ${raw.conditionId} is not a binary market`);
   }
-  const lowerOutcomes = raw.outcomes.map(o => o.toLowerCase());
+
+  const lowerOutcomes = outcomes.map((o) => o.toLowerCase());
   if (!lowerOutcomes.includes('yes') || !lowerOutcomes.includes('no')) {
     throw new Error(`Polymarket market ${raw.conditionId} outcomes are not Yes/No`);
   }
- 
-  const yesPrice = derivePolymarketYesPrice(raw, warnings);
+
+  const yesPrice = derivePolymarketYesPrice(raw.conditionId, outcomes, outcomePrices, warnings);
   const noPrice = roundPrice(1 - yesPrice);
- 
+
   const title = raw.question.trim();
   const status = raw.closed ? 'closed' : 'open';
   const resolved = raw.resolution === 'yes' || raw.resolution === 'no';
   const resolution = raw.resolution === 'yes' ? 'YES' : raw.resolution === 'no' ? 'NO' : null;
- 
+
+  // Use events[0].slug for URL if available, matching polymarket-client.ts in musashi-api
+  const eventSlug = raw.events?.[0]?.slug ?? raw.slug ?? raw.conditionId;
+
   return {
     market: {
       id: `musashi-polymarket-${raw.conditionId}`,
       platform: 'polymarket',
       platform_id: raw.conditionId,
       event_id: raw.questionID ?? null,
-      series_id: null, // Polymarket has no series concept
+      series_id: null,
       title,
       description: raw.description?.trim() ?? null,
       category: normalizePolymarketCategory(raw),
-      url: `https://polymarket.com/event/${raw.slug ?? raw.conditionId}`,
+      url: `https://polymarket.com/event/${eventSlug}`,
       yes_price: yesPrice,
       no_price: noPrice,
-      volume_24h: parsePolymarketNumber(raw.volume24hr) ?? 0,
-      open_interest: null, // not provided by gamma API
+      // volume24hr is a number in real Gamma responses
+      volume_24h: typeof raw.volume24hr === 'number' ? raw.volume24hr : (parsePolymarketNumber(raw.volume24hr) ?? 0),
+      open_interest: null,
       liquidity: parsePolymarketNumber(raw.liquidity),
-      spread: null, // not provided by gamma API
+      spread: null,
       status,
       created_at: raw.createdAt ?? null,
-      closes_at: raw.endDate ?? null,
-      settles_at: raw.endDate ?? null, // Polymarket uses endDate for both
+      closes_at: raw.endDate ?? raw.endDateIso ?? null,
+      settles_at: raw.endDate ?? raw.endDateIso ?? null,
       resolved,
       resolution,
-      resolved_at: null, // not provided by gamma API
+      resolved_at: null,
       fetched_at: fetchedAt.toISOString(),
       cache_hit: false,
       data_age_seconds: 0,
@@ -242,14 +259,11 @@ export function normalizePolymarketMarket(raw: PolymarketMarketRaw, fetchedAt: D
     warnings,
   };
 }
- 
-export function normalizePolymarketBatch(
-  rawMarkets: PolymarketMarketRaw[],
-  fetchedAt: Date
-): NormalizationBatch {
+
+export function normalizePolymarketBatch(rawMarkets: PolymarketMarketRaw[], fetchedAt: Date): NormalizationBatch {
   const normalized: NormalizerResult[] = [];
   const errors: NormalizerError[] = [];
- 
+
   for (const raw of rawMarkets) {
     try {
       normalized.push(normalizePolymarketMarket(raw, fetchedAt));
@@ -261,68 +275,90 @@ export function normalizePolymarketBatch(
       });
     }
   }
- 
+
   return { normalized, errors };
 }
- 
-function derivePolymarketYesPrice(raw: PolymarketMarketRaw, warnings: string[]): number {
-  if (!Array.isArray(raw.outcomePrices) || raw.outcomePrices.length !== 2) {
-    warnings.push(`Market ${raw.conditionId} missing outcomePrices; defaulting to 0.5`);
+
+function derivePolymarketYesPrice(
+  conditionId: string,
+  outcomes: string[],
+  outcomePrices: string[] | null,
+  warnings: string[]
+): number {
+  if (!outcomePrices || outcomePrices.length !== 2) {
+    warnings.push(`Market ${conditionId} missing outcomePrices; defaulting to 0.5`);
     return 0.5;
   }
- 
-  const yesIdx = raw.outcomes.findIndex(o => o.toLowerCase() === 'yes');
+
+  const yesIdx = outcomes.findIndex((o) => o.toLowerCase() === 'yes');
   if (yesIdx === -1) {
-    warnings.push(`Market ${raw.conditionId} has no Yes outcome; defaulting to 0.5`);
+    warnings.push(`Market ${conditionId} has no Yes outcome; defaulting to 0.5`);
     return 0.5;
   }
- 
-  const rawPrice = raw.outcomePrices[yesIdx];
+
+  const rawPrice = outcomePrices[yesIdx];
   if (rawPrice === undefined) {
-    warnings.push(`Market ${raw.conditionId} missing price for Yes outcome; defaulting to 0.5`);
+    warnings.push(`Market ${conditionId} missing price for Yes outcome; defaulting to 0.5`);
     return 0.5;
   }
 
   const parsed = parseFloat(rawPrice);
   if (isNaN(parsed) || parsed < 0 || parsed > 1) {
-    throw new Error(`Polymarket market ${raw.conditionId} has out-of-range yes price: ${rawPrice}`);
+    throw new Error(`Polymarket market ${conditionId} has out-of-range yes price: ${rawPrice}`);
   }
 
   return roundPrice(parsed);
 }
- 
+
 function normalizePolymarketCategory(raw: PolymarketMarketRaw): MarketCategory {
   const category = raw.category?.toLowerCase().trim() ?? '';
   const question = raw.question?.toUpperCase() ?? '';
-  const tags = (raw.tags ?? []).map(t => t.toLowerCase());
- 
-  if (category.includes('crypto') || tags.includes('crypto') ||
-      /BTC|ETH|SOL|XRP|DOGE|BITCOIN|ETHEREUM|CRYPTO/.test(question)) return 'crypto';
- 
-  if (category.includes('politic') || category.includes('elect') || tags.includes('politics') ||
-      /TRUMP|BIDEN|HARRIS|CONGRESS|SENATE|ELECT|GOP|DEM|POTUS|PRESIDENT/.test(question)) return 'us_politics';
- 
-  if (category.includes('sport') || tags.includes('sports') ||
-      /NFL|NBA|MLB|NHL|SUPER BOWL|WORLD CUP|FIFA|GOLF|TENNIS/.test(question)) return 'sports';
- 
-  if (category.includes('tech') || tags.includes('tech') ||
-      /NVDA|AAPL|MSFT|GOOGLE|META|AMAZON|OPENAI|TESLA|AI MODEL/.test(question)) return 'technology';
- 
-  if (/FED|CPI|GDP|INFLATION|RATE|RECESSION|UNEMPLOYMENT|JOBS REPORT/.test(question)) return 'economics';
- 
-  if (/S&P|NASDAQ|DOW|STOCK|MARKET CAP|IPO/.test(question)) return 'financial_markets';
- 
-  if (/UKRAINE|RUSSIA|CHINA|NATO|TAIWAN|ISRAEL|GAZA|IRAN|NORTH KOREA/.test(question)) return 'geopolitics';
- 
-  if (/CLIMATE|HURRICANE|EARTHQUAKE|CARBON|OIL|ENERGY/.test(question)) return 'climate';
- 
-  if (/OSCAR|EMMY|GRAMMY|MOVIE|FILM|ALBUM|TOUR/.test(question)) return 'entertainment';
- 
+  const tags = (raw.tags ?? []).map((t) => t.toLowerCase());
+
+  if (
+    category.includes('crypto') ||
+    tags.includes('crypto') ||
+    /BTC|ETH|SOL|XRP|DOGE|BITCOIN|ETHEREUM|CRYPTO/.test(question)
+  )
+    return 'crypto';
+
+  if (
+    category.includes('politic') ||
+    category.includes('elect') ||
+    tags.includes('politics') ||
+    /TRUMP|BIDEN|HARRIS|CONGRESS|SENATE|ELECT|GOP|DEM|POTUS|PRESIDENT/.test(question)
+  )
+    return 'us_politics';
+
+  if (
+    category.includes('sport') ||
+    tags.includes('sports') ||
+    /NFL|NBA|MLB|NHL|SUPER BOWL|WORLD CUP|FIFA|GOLF|TENNIS/.test(question)
+  )
+    return 'sports';
+
+  if (
+    category.includes('tech') ||
+    tags.includes('tech') ||
+    /NVDA|AAPL|MSFT|GOOGLE|META|AMAZON|OPENAI|TESLA|AI MODEL/.test(question)
+  )
+    return 'technology';
+
   if (/FED FUND|FOMC|FEDERAL RESERVE|BASIS POINT/.test(question)) return 'fed_policy';
- 
+
+  if (/FED|CPI|GDP|INFLATION|RATE|RECESSION|UNEMPLOYMENT|JOBS REPORT/.test(question)) return 'economics';
+
+  if (/S&P|NASDAQ|DOW|STOCK|MARKET CAP|IPO/.test(question)) return 'financial_markets';
+
+  if (/UKRAINE|RUSSIA|CHINA|NATO|TAIWAN|ISRAEL|GAZA|IRAN|NORTH KOREA/.test(question)) return 'geopolitics';
+
+  if (/CLIMATE|HURRICANE|EARTHQUAKE|CARBON|OIL|ENERGY/.test(question)) return 'climate';
+
+  if (/OSCAR|EMMY|GRAMMY|MOVIE|FILM|ALBUM|TOUR/.test(question)) return 'entertainment';
+
   return 'other';
 }
- 
+
 function parsePolymarketNumber(value: string | number | undefined | null): number | null {
   if (value === null || value === undefined) return null;
   const parsed = typeof value === 'number' ? value : parseFloat(value);
